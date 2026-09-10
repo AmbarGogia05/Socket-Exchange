@@ -1,5 +1,10 @@
 from order_book import Order, OrderBook
-import socket, select
+import socket, select, sys, time
+
+
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+
 
 class ClientState:
     def __init__(self, connection_id):
@@ -8,6 +13,7 @@ class ClientState:
         self.recv_buffer = b""
         self.username = None
         self.subscriptions = set()
+
 
 class Server:
     def __init__(self, host, port):
@@ -34,6 +40,7 @@ class Server:
                             filter=select.KQ_FILTER_READ,
                             flags=select.KQ_EV_ADD)
         self.k_queue.control([reg], 0, None)
+        log(f"LISTENING on {self.host}:{self.port} (listener fd={self.listener.fileno()})")
 
     def run(self):
         while True:
@@ -64,19 +71,28 @@ class Server:
                                 filter=select.KQ_FILTER_READ,
                                 flags=select.KQ_EV_ADD)
             self.k_queue.control([reg], 0, None)
+            log(f"ACCEPT fd={connection_fd} conn_id={connection_id} from {address[0]}:{address[1]}")
 
     def on_read(self, fd):
         state = self.client_states[fd]
-        chunk = self.connections[fd].recv(4096)
-        if not chunk:                       # EOF -> client closed
+        try:
+            chunk = self.connections[fd].recv(4096)
+        except OSError as e:
+            log(f"RESET fd={fd} (abrupt close: {e})")
+            self.terminate(fd)
+            return
+        if not chunk:                       # orderly EOF (FIN)
+            log(f"EOF fd={fd} (orderly close)")
             self.terminate(fd)
             return
 
+        log(f"RECV fd={fd} {len(chunk)} bytes: {chunk!r}")
         state.recv_buffer += chunk
         while b"\n" in state.recv_buffer:
             line, state.recv_buffer = state.recv_buffer.split(b"\n", 1)
             text = line.decode().strip()
             if text:
+                log(f"CMD  fd={fd}: {text!r}")
                 self.resolve(fd, text)
 
     def terminate(self, fd):
@@ -91,10 +107,12 @@ class Server:
             self.connections[fd].close()
         self.connections.pop(fd, None)
         self.client_states.pop(fd, None)
+        log(f"TEARDOWN fd={fd}")
 
     def send(self, fd, msg):
         try:
             self.connections[fd].sendall((msg + "\n").encode())
+            log(f"SEND fd={fd}: {msg!r}")
         except (OSError, KeyError):
             pass                            # socket gone
 
@@ -113,7 +131,7 @@ class Server:
         if state.role == "undecided":
             if command == "LOGIN":
                 state.role = "trader"
-            elif command == "SUBSCRIBE":
+            elif command == "SUBSCRIBE" or command == "UNSUBSCRIBE":
                 state.role = "market-data"
             elif command == "QUIT":
                 pass
@@ -214,7 +232,6 @@ class Server:
 
 
 if __name__ == "__main__":
-    import sys
     host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
     Server(host, port).run()
