@@ -12,6 +12,7 @@
 import resource
 import socket
 import sys
+import time
 
 
 def raise_fd_limit(want):
@@ -27,17 +28,27 @@ def raise_fd_limit(want):
 def add_connections(host, ports, sockets, count):
     """Open `count` more connections; return how many succeeded."""
     added = 0
-    for _ in range(count):
+    retries = 0
+    while added < count:
         port = ports[len(sockets) % len(ports)]
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        except OSError as e:               # ENOBUFS/EMFILE creating the socket
+            print(f"stopped (socket create): {e}", file=sys.stderr)
+            break
         try:
             sock.connect((host, port))
-        except OSError as e:               # EMFILE, EADDRNOTAVAIL, etc.
+        except OSError as e:               # often transient: backlog full -> ECONNRESET
             sock.close()
-            print(f"stopped: {e}", file=sys.stderr)
-            break
+            retries += 1
+            if retries > 500:              # persistent -> real ceiling, give up
+                print(f"stopped (connect, gave up): {e}", file=sys.stderr)
+                break
+            time.sleep(0.002)              # let the server drain its accept queue
+            continue
         sockets.append(sock)
         added += 1
+        retries = 0                        # progress made; reset the retry budget
     return added
 
 

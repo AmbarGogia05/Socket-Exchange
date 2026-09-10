@@ -16,7 +16,7 @@ class ClientState:
 
 
 class Server:
-    LISTEN_BACKLOG = 1024               # large backlog for the bonus connection storm
+    LISTEN_BACKLOG = 4096               # large backlog for the bonus connection storm
 
     def __init__(self, host, ports):
         self.host = host
