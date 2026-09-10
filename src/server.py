@@ -16,9 +16,12 @@ class ClientState:
 
 
 class Server:
-    def __init__(self, host, port):
+    LISTEN_BACKLOG = 1024               # large backlog for the bonus connection storm
+
+    def __init__(self, host, ports):
         self.host = host
-        self.port = port
+        self.ports = ports              # one or more ports; multi-port lifts the
+                                        # single 4-tuple (~65k) connection ceiling
         self.order_book = OrderBook()
         self.connections = {}               # fd -> socket
         self.client_states = {}             # fd -> ClientState
@@ -26,37 +29,42 @@ class Server:
         self.subscribers = {"JNST": set(), "IMCT": set()}
         self.next_connection_id = 0         # monotonic; owner handles come from here
         self.connection_id_to_fd = {}       # connection_id -> current fd
-        self.listener = None
-        self.k_queue = None
-
-        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.listener.bind((self.host, self.port))
-        self.listener.listen()
-        self.listener.setblocking(False)
-
+        self.listeners = {}                 # listener fd -> listener socket
         self.k_queue = select.kqueue()
-        reg = select.kevent(self.listener.fileno(),
-                            filter=select.KQ_FILTER_READ,
-                            flags=select.KQ_EV_ADD)
-        self.k_queue.control([reg], 0, None)
-        log(f"LISTENING on {self.host}:{self.port} (listener fd={self.listener.fileno()})")
+
+        for port in self.ports:
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((self.host, port))
+            listener.listen(self.LISTEN_BACKLOG)
+            listener.setblocking(False)
+            self.listeners[listener.fileno()] = listener
+
+            reg = select.kevent(listener.fileno(),
+                                filter=select.KQ_FILTER_READ,
+                                flags=select.KQ_EV_ADD)
+            self.k_queue.control([reg], 0, None)
+            log(f"LISTENING on {self.host}:{port} (listener fd={listener.fileno()})")
 
     def run(self):
         while True:
             events = self.k_queue.control(None, 32, None)
             for event in events:
                 fd = event.ident
-                if fd == self.listener.fileno():
-                    self.on_accept(event.data)
+                if fd in self.listeners:
+                    self.on_accept(self.listeners[fd], event.data)
                 elif fd in self.connections:
                     self.on_read(fd)
                 else:
                     continue                # stale event for a torn-down fd
 
-    def on_accept(self, count):
+    def on_accept(self, listener, count):
         for _ in range(count):
-            connection, address = self.listener.accept()
+            try:
+                connection, address = listener.accept()
+            except OSError as e:            # EMFILE / ECONNABORTED / EWOULDBLOCK
+                log(f"ACCEPT skipped: {e}")
+                break
             connection.setblocking(False)
             connection_fd = connection.fileno()
 
@@ -146,6 +154,9 @@ class Server:
             return
 
         if command == "LOGIN":
+            if state.username is not None:
+                self.send(fd, "ERROR already logged in")
+                return
             if len(args) != 1:
                 self.send(fd, "ERROR usage: LOGIN <username>")
                 return
@@ -233,5 +244,5 @@ class Server:
 
 if __name__ == "__main__":
     host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
-    Server(host, port).run()
+    ports = [int(p) for p in sys.argv[2:]] if len(sys.argv) > 2 else [5000]
+    Server(host, ports).run()
